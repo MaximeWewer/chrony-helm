@@ -1,0 +1,8 @@
+# expect: chronyd advertises its own NTP port
+containerPorts:
+  ntp: 1123
+nts:
+  server:
+    enabled: true
+    certificate:
+      existingSecret: tls

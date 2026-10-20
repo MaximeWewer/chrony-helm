@@ -1,0 +1,82 @@
+{{- if and .Values.monitoring.enabled .Values.monitoring.prometheusRule.enabled -}}
+{{- $pr := .Values.monitoring.prometheusRule -}}
+{{- $sel := printf "namespace=\"%s\", service=\"%s-metrics\"" .Release.Namespace (include "chrony.fullname" .) -}}
+{{- $local := printf "127.0.0.1:%d" (int .Values.containerPorts.ntp) -}}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "chrony.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "chrony.labels" . | nindent 4 }}
+    {{- with $pr.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: {{ include "chrony.fullname" . }}.rules
+      rules:
+        {{- if $pr.defaultsEnabled }}
+        - alert: ChronyUnreadable
+          expr: ntp_chrony_up{ {{- $sel -}} } == 0
+          for: 5m
+          labels:
+            severity: {{ $pr.severity }}
+          annotations:
+            summary: "ntp-exporter in {{ "{{" }} $labels.pod {{ "}}" }} cannot read chronyd"
+            description: "The command socket does not answer: chronyd is down, or it disabled the socket (look for 'Disabled command socket' in its log)."
+        - alert: ChronyUnsynchronised
+          expr: ntp_chrony_leap_status{ {{- $sel -}} } == 3
+          for: 10m
+          labels:
+            severity: {{ $pr.severity }}
+          annotations:
+            summary: "chronyd in {{ "{{" }} $labels.pod {{ "}}" }} is not synchronised"
+            description: "No selected source for 10 minutes: upstreams unreachable (egress UDP/123, TCP/4460 for NTS) or all rejected."
+        - alert: ChronyStale
+          expr: time() - ntp_chrony_reference_timestamp_seconds{ {{- $sel -}} } > 3600
+          for: 10m
+          labels:
+            severity: {{ $pr.severity }}
+          annotations:
+            summary: "chronyd in {{ "{{" }} $labels.pod {{ "}}" }} has not updated its clock for over an hour"
+            description: "chronyd is in holdover: its sources stopped providing usable samples."
+        - alert: ChronyOffsetHigh
+          expr: abs(ntp_chrony_system_time_offset_seconds{ {{- $sel -}} }) > {{ $pr.maxOffsetSeconds }}
+          for: 10m
+          labels:
+            severity: {{ $pr.severity }}
+          annotations:
+            summary: "chronyd in {{ "{{" }} $labels.pod {{ "}}" }} reports an offset of {{ "{{" }} $value | humanizeDuration {{ "}}" }}"
+            description: "The system time offset chronyd reports stays above {{ $pr.maxOffsetSeconds }}s."
+        - alert: ChronyStratumHigh
+          expr: ntp_chrony_stratum{ {{- $sel -}} } > {{ $pr.maxStratum }}
+          for: 15m
+          labels:
+            severity: {{ $pr.severity }}
+          annotations:
+            summary: "chronyd in {{ "{{" }} $labels.pod {{ "}}" }} is at stratum {{ "{{" }} $value {{ "}}" }}"
+            description: "Stratum above {{ $pr.maxStratum }}: the upstream chain is long or degraded."
+        {{- if and .Values.monitoring.exporter.measureLocalServer (ne (int .Values.containerPorts.ntp) 0) }}
+        - alert: ChronyNotServingTime
+          expr: ntp_response_valid{ {{- $sel -}}, server="{{ $local }}"} == 0
+          for: 15m
+          labels:
+            severity: {{ $pr.severity }}
+          annotations:
+            summary: "chronyd in {{ "{{" }} $labels.pod {{ "}}" }} gives no valid time to its clients"
+            description: "Queried on localhost like a client, the server answers nothing usable (unsynchronised, root distance too large, or not answering)."
+        - alert: ChronyServedRootDistanceHigh
+          expr: ntp_root_distance_seconds{ {{- $sel -}}, server="{{ $local }}"} > {{ $pr.maxRootDistanceSeconds }}
+          for: 15m
+          labels:
+            severity: {{ $pr.severity }}
+          annotations:
+            summary: "chronyd in {{ "{{" }} $labels.pod {{ "}}" }} serves a root distance of {{ "{{" }} $value | humanizeDuration {{ "}}" }}"
+            description: "The error bound announced to clients stays above {{ $pr.maxRootDistanceSeconds }}s."
+        {{- end }}
+        {{- end }}
+        {{- with $pr.additionalRules }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+{{- end }}

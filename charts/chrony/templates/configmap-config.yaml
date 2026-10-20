@@ -1,0 +1,12 @@
+{{- if .Values.chrony.config.inline -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "chrony.configConfigMapName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "chrony.labels" . | nindent 4 }}
+data:
+  {{ .Values.chrony.config.key }}: |
+    {{- tpl .Values.chrony.config.inline . | nindent 4 }}
+{{- end }}

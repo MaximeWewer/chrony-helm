@@ -1,0 +1,62 @@
+{{- if and .Values.tests.enabled .Values.service.enabled -}}
+{{- /*
+`helm test`: a one-shot chronyd in query mode (-Q) asks the Service for time and
+exits 0 only once it got a usable sample - the same path a real client takes,
+through the Service, the access rules and source selection. It runs from the
+release namespace, so `chrony.allow` must cover the pod network (the default
+private ranges do).
+*/ -}}
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ include "chrony.fullname" . }}-test
+  namespace: {{ .Release.Namespace }}
+  # Not the release selector labels: the Services, PDB and NetworkPolicy
+  # must not pick this pod up.
+  labels:
+    helm.sh/chart: {{ include "chrony.chart" . }}
+    app.kubernetes.io/name: {{ printf "%s-test" (include "chrony.name" .) | quote }}
+    app.kubernetes.io/instance: {{ .Release.Name | quote }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/component: test
+  annotations:
+    helm.sh/hook: test
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  enableServiceLinks: false
+  {{- with .Values.imagePullSecrets }}
+  imagePullSecrets:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: query
+      image: {{ include "chrony.image" (dict "image" .Values.image "default" .Chart.AppVersion) | quote }}
+      imagePullPolicy: {{ .Values.image.pullPolicy }}
+      command:
+        - /usr/local/sbin/chronyd
+        - -Q
+        - -t
+        - {{ .Values.tests.timeout | quote }}
+        - -f
+        - /dev/null
+        - "server {{ include "chrony.fullname" . }}.{{ .Release.Namespace }}.svc port {{ .Values.service.ntpPort }} iburst maxsamples 4"
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: [ALL]
+      resources:
+        requests:
+          cpu: 10m
+          memory: 16Mi
+        limits:
+          memory: 64Mi
+{{- end }}

@@ -1,0 +1,169 @@
+{{- if and (include "chrony.ntsSharedKeys" .) (not .Values.nts.server.sharedKeys.existingSecret) -}}
+{{- /*
+Shared NTS server keys, created at runtime by a pre-install/pre-upgrade hook
+instead of being rendered: a rendered Secret needs `lookup` to stay stable,
+and tools that render without cluster access (Argo CD, `helm template`) would
+regenerate it on every sync. The Job creates the Secret only when it is
+missing, so it never touches existing keys. Argo CD runs these hooks as
+PreSync.
+
+The Secret is not owned by the release: `helm uninstall` leaves it, which
+keeps the keys - and the cookies clients hold - across a reinstall.
+
+chronyd's key dump format (nts_ke_server.c, load_keys): an "NKS1" header, the
+age of the current key, then four "<id hex> <key hex> <SIV algorithm>" lines
+whose ids are consecutive modulo 4 - the last one is current. Algorithm 15 is
+AES-SIV-CMAC-256 (32-byte keys), the one every chrony build supports.
+*/ -}}
+{{- $name := printf "%s-nts-keys" (include "chrony.fullname" .) -}}
+{{- $job := .Values.nts.server.sharedKeys.job -}}
+{{- $hook := dict "helm.sh/hook" "pre-install,pre-upgrade" "helm.sh/hook-delete-policy" "before-hook-creation,hook-succeeded" -}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "chrony.labels" . | nindent 4 }}
+    app.kubernetes.io/component: nts-keys
+  annotations:
+    {{- toYaml (merge (dict "helm.sh/hook-weight" "-10") $hook) | nindent 4 }}
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "chrony.labels" . | nindent 4 }}
+    app.kubernetes.io/component: nts-keys
+  annotations:
+    {{- toYaml (merge (dict "helm.sh/hook-weight" "-10") $hook) | nindent 4 }}
+rules:
+  # `create` cannot be scoped by name in RBAC; `get` can.
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [create]
+  - apiGroups: [""]
+    resources: [secrets]
+    resourceNames: [{{ $name | quote }}]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "chrony.labels" . | nindent 4 }}
+    app.kubernetes.io/component: nts-keys
+  annotations:
+    {{- toYaml (merge (dict "helm.sh/hook-weight" "-10") $hook) | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "chrony.labels" . | nindent 4 }}
+    app.kubernetes.io/component: nts-keys
+  annotations:
+    {{- toYaml (merge (dict "helm.sh/hook-weight" "-5") $hook) | nindent 4 }}
+spec:
+  backoffLimit: 3
+  activeDeadlineSeconds: 300
+  template:
+    metadata:
+      # Not the release selector labels: the Services, PDB and NetworkPolicy
+      # of the chrony pods must not pick this pod up.
+      labels:
+        app.kubernetes.io/name: {{ printf "%s-nts-keys" (include "chrony.name" .) | quote }}
+        app.kubernetes.io/instance: {{ .Release.Name | quote }}
+        app.kubernetes.io/component: nts-keys
+    spec:
+      serviceAccountName: {{ $name }}
+      automountServiceAccountToken: true
+      restartPolicy: Never
+      enableServiceLinks: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: create
+          image: {{ include "chrony.image" (dict "image" $job.image "default" "latest") | quote }}
+          imagePullPolicy: {{ $job.image.pullPolicy }}
+          command: [/bin/sh, -ec]
+          args:
+            - |
+              if kubectl get secret "$SECRET" -o name >/dev/null 2>&1; then
+                echo "$SECRET exists - keeping its keys"
+                exit 0
+              fi
+              umask 077
+              base=$(( $(od -An -N4 -tu4 /dev/urandom) & 0x7ffffff0 ))
+              {
+                echo NKS1
+                echo 0.0
+                for i in 0 1 2 3; do
+                  printf '%08X %s 15\n' $((base + i)) \
+                    "$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n' | tr a-f A-F)"
+                done
+              } > /tmp/ntskeys
+              # Labelled before creation: the Role grants no patch.
+              kubectl create secret generic "$SECRET" --from-file=ntskeys=/tmp/ntskeys \
+                  --dry-run=client -o yaml > /tmp/secret.yaml
+              kubectl label --local -f /tmp/secret.yaml -o yaml \
+                  app.kubernetes.io/name={{ include "chrony.name" . }} \
+                  app.kubernetes.io/instance={{ .Release.Name }} \
+                  app.kubernetes.io/component=nts-keys > /tmp/labelled.yaml
+              # AlreadyExists means another run won the race: its keys stand.
+              if ! out=$(kubectl create -f /tmp/labelled.yaml 2>&1); then
+                echo "$out" | grep -q AlreadyExists || { echo "$out" >&2; exit 1; }
+              fi
+              echo "$SECRET created"
+          env:
+            - name: SECRET
+              value: {{ $name | quote }}
+            - name: HOME
+              value: /tmp
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            {{- toYaml $job.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Mi
+{{- end }}

@@ -1,0 +1,131 @@
+name: Release Helm Chart
+
+on:
+  workflow_dispatch:
+    inputs:
+      force_version:
+        description: "Override version (format YYYY.M.X, no leading v). Empty = auto-increment."
+        required: false
+        type: string
+  pull_request:
+    types: [closed]
+    branches: [main]
+    paths:
+      - 'charts/**'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    # Manual dispatch, or any merged PR touching the chart tree.
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event.pull_request.merged == true
+    permissions:
+      contents: write        # commit the released version back to main
+      packages: write        # push the chart to GHCR
+
+    env:
+      CHART_DIR: charts/chrony
+      CHART_NAME: chrony
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          # `pull_request: closed` checks out a detached merge ref, from which
+          # the released version could not be committed back. Take main.
+          ref: main
+          # Kept so the commit back can push; the workflow has no `push:`
+          # trigger, so it cannot retrigger itself.
+          persist-credentials: true
+
+      - name: Install Helm
+        uses: azure/setup-helm@v5
+
+      - name: Convert repository owner to lowercase
+        id: lowercase
+        run: |
+          OWNER_LOWER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          echo "owner=${OWNER_LOWER}" >> $GITHUB_OUTPUT
+
+      - name: Login to GitHub Container Registry
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Compute chart version
+        id: chart
+        env:
+          FORCE: ${{ inputs.force_version }}
+        run: |
+          set -euo pipefail
+          # CalVer YYYY.M.PATCH, month not zero-padded. The patch comes from
+          # the REGISTRY, which is what consumers pin: walk up from .1 until a
+          # version is free. Never read from Chart.yaml - a stored version only
+          # moves when someone remembers to move it.
+          REPO="ghcr.io/${{ steps.lowercase.outputs.owner }}/charts/${CHART_NAME}"
+          if [ -n "$FORCE" ]; then
+            echo "$FORCE" | grep -qE '^[0-9]{4}\.[0-9]{1,2}\.[0-9]+$' \
+              || { echo "::error::force_version must be YYYY.M.X"; exit 1; }
+            VERSION="$FORCE"
+          else
+            PREFIX="$(date -u +%Y).$(date -u +%-m)"
+            PATCH=1
+            while [ "$PATCH" -le 99 ]; do
+              helm show chart "oci://${REPO}" --version "${PREFIX}.${PATCH}" >/dev/null 2>&1 || break
+              PATCH=$((PATCH + 1))
+            done
+            [ "$PATCH" -le 99 ] || { echo "::error::no free patch left under ${PREFIX}"; exit 1; }
+            VERSION="${PREFIX}.${PATCH}"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Releasing chart version: $VERSION"
+
+      - name: Refuse to overwrite a published version
+        run: |
+          set -euo pipefail
+          # An OCI tag is mutable: overwriting one rewrites what every existing
+          # pin resolves to. Only force_version can get here with a taken one.
+          VERSION='${{ steps.chart.outputs.version }}'
+          REPO="ghcr.io/${{ steps.lowercase.outputs.owner }}/charts/${CHART_NAME}"
+          if helm show chart "oci://${REPO}" --version "${VERSION}" >/dev/null 2>&1; then
+            echo "::error::${REPO}:${VERSION} is already published - pick another version."
+            exit 1
+          fi
+          echo "${VERSION} is not published yet"
+
+      - name: Stamp the computed version into Chart.yaml
+        env:
+          VERSION: ${{ steps.chart.outputs.version }}
+        run: |
+          # `helm package --version` would only rewrite the packaged copy; stamp
+          # the file so the commit back records what was released.
+          sed -i -E "0,/^version:/s/^version:.*/version: ${VERSION}/" ${CHART_DIR}/Chart.yaml
+          grep -q "^version: ${VERSION}$" ${CHART_DIR}/Chart.yaml
+
+      - name: Lint and render (fail-fast)
+        run: |
+          pip install --quiet pyyaml
+          make lint template
+
+      - name: Package Helm chart
+        run: helm package ${CHART_DIR} --version ${{ steps.chart.outputs.version }}
+
+      - name: Push Helm chart to GHCR
+        run: |
+          helm push ${CHART_NAME}-${{ steps.chart.outputs.version }}.tgz oci://ghcr.io/${{ steps.lowercase.outputs.owner }}/charts
+
+      # Only once the push succeeded: main records what is actually published.
+      - name: Commit the released version back to main
+        env:
+          VERSION: ${{ steps.chart.outputs.version }}
+        run: |
+          set -euo pipefail
+          git add ${CHART_DIR}/Chart.yaml
+          if git diff --cached --quiet; then
+            echo "Chart.yaml already at ${VERSION} - nothing to commit."
+            exit 0
+          fi
+          git -c user.name='github-actions[bot]' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              commit -m "chore(release): chrony ${VERSION}"
+          git push origin HEAD:main

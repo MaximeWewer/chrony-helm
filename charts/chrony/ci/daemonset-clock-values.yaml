@@ -1,0 +1,17 @@
+# Node clock discipline: one root-started chronyd per node on the host network.
+workload:
+  kind: DaemonSet
+hostNetwork: true
+clockControl:
+  enabled: true
+service:
+  internalTrafficPolicy: Local
+tolerations:
+  - operator: Exists
+priorityClassName: system-node-critical
+chrony:
+  pools: [pool.ntp.org]
+  servers: []
+nts:
+  client:
+    enabled: false

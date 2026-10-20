@@ -1,0 +1,22 @@
+# Public NTS server: cert-manager certificate, keys shared by 3 replicas,
+# LoadBalancer keeping client addresses, rate limiting.
+replicaCount: 3
+nts:
+  server:
+    enabled: true
+    ntpServer: [time.example.org]
+    certificate:
+      certManager:
+        enabled: true
+        issuerRef:
+          name: letsencrypt
+        dnsNames: [time.example.org]
+      reloaderAnnotation: true
+service:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+  loadBalancerSourceRanges: [0.0.0.0/0]
+chrony:
+  allow: [all]
+  rateLimit: "on"
+  ntsRateLimit: "on"

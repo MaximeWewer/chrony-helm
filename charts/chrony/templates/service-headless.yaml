@@ -1,0 +1,25 @@
+{{- if eq (include "chrony.kind" .) "StatefulSet" -}}
+{{- /*
+Governing Service of the StatefulSet: stable per-replica names
+(<pod>.<fullname>-headless), e.g. to point NTP clients at one given replica or
+to declare the replicas as `peers` of each other.
+*/ -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "chrony.headlessServiceName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "chrony.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "chrony.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: ntp
+      port: {{ .Values.containerPorts.ntp }}
+      targetPort: ntp
+      protocol: UDP
+{{- end }}

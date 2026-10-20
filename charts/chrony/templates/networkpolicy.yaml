@@ -1,0 +1,75 @@
+{{- if .Values.networkPolicy.enabled -}}
+{{- $np := .Values.networkPolicy -}}
+{{- $promNs := default .Release.Namespace $np.prometheusNamespace -}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "chrony.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "chrony.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "chrony.selectorLabels" . | nindent 6 }}
+  policyTypes: [Ingress, Egress]
+
+  ingress:
+    # 1) NTP / NTS-KE clients. chrony's own allow/deny still applies on top.
+    - ports:
+        - protocol: UDP
+          port: {{ .Values.containerPorts.ntp }}
+        {{- if .Values.nts.server.enabled }}
+        - protocol: TCP
+          port: {{ .Values.containerPorts.nts }}
+        {{- end }}
+      {{- with $np.ingressFrom }}
+      from:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    {{- if .Values.monitoring.enabled }}
+    # 2) Prometheus scrape of the exporter sidecar.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $promNs }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.monitoring.exporter.port }}
+    {{- end }}
+    {{- with $np.extraIngress }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+
+  egress:
+    {{- if $np.allowDNS }}
+    # 1) Name resolution - sources are usually hostnames.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    {{- end }}
+    # 2) Upstream NTP and NTS-KE. NTS-KE negotiates the NTP server and port,
+    #    which may differ from the host it was asked on; UDP/123 is the norm.
+    - to:
+        {{- range $np.upstreamCIDRs }}
+        - ipBlock:
+            cidr: {{ . }}
+        {{- end }}
+      ports:
+        - protocol: UDP
+          port: 123
+        - protocol: TCP
+          port: 4460
+    {{- with $np.extraEgress }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+{{- end }}

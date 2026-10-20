@@ -1,0 +1,205 @@
+{{ template "chart.header" . }}
+
+{{ template "chart.description" . }}
+
+The image is [chrony-docker](https://github.com/maximewewer/chrony-docker)
+(`ghcr.io/maximewewer/chrony-docker`):
+static chronyd/chronyc on distroless, uid 65532, seccomp filter on, command
+port disabled (Unix socket only). The chart drives its `chrony-entrypoint`
+through environment variables - it never templates a chrony.conf unless you
+ask it to.
+
+## Install
+
+```sh
+helm install chrony oci://ghcr.io/maximewewer/charts/chrony \
+  --namespace time --create-namespace
+helm test -n time chrony
+```
+
+Defaults: a Deployment of 2 replicas syncing over **NTS** from four public
+servers (Cloudflare, Netnod, PTB x2), serving NTP on UDP/123 to private
+address ranges through a ClusterIP Service, not touching any node clock.
+
+## Choosing a shape
+
+| Goal | Values |
+|------|--------|
+| In-cluster NTP service | defaults |
+| Fast resync after restarts (drift file + NTS cookies kept) | `workload.kind: StatefulSet` |
+| Public NTP/NTS server | `service.type: LoadBalancer`, `service.externalTrafficPolicy: Local` (required with rate limiting), `chrony.allow: [all]`, `chrony.rateLimit: "on"`, `nts.server.enabled: true` |
+| Node-local time for pods | `workload.kind: DaemonSet`, `service.internalTrafficPolicy: Local` |
+| Discipline the node clocks | `workload.kind: DaemonSet`, `hostNetwork: true`, `clockControl.enabled: true` |
+| Internal upstreams only (no Internet) | `nts.client.enabled: false`, `chrony.servers: [ntp1.corp, ntp2.corp]` |
+
+`ci/*-values.yaml` holds a working example of each.
+
+## How it is wired
+
+* **State.** chronyd keeps drift, NTS cookies and its command
+  socket in `/run/chrony/state`. The volume (emptyDir, or a PVC with a
+  StatefulSet) is mounted on `/run/chrony` and the entrypoint locks `state/`
+  down to 0700: chronyd refuses to open its command socket in a
+  world-accessible directory, which is exactly what a fresh emptyDir is - and
+  without the socket, `chronyc` and the exporter go blind. `/run/chrony/**`
+  rather than the image's `/var/lib/chrony`: Ubuntu's AppArmor profile for
+  `/usr/sbin/chronyd` attaches by path to any unconfined process running that
+  binary - containers included - and only lets it write `/var/lib/chrony/*`
+  one level deep, but all of `/run/chrony/**`. The image uses the same path,
+  and installs chronyd as `/usr/local/sbin/chronyd` so that profile does not
+  attach at all (it would also block the runtime's SIGTERM).
+* **Port 123 without root.** The pod sets the namespaced sysctl
+  `net.ipv4.ip_unprivileged_port_start=123` (a *safe* sysctl since Kubernetes
+  1.22), so chronyd binds 123 as uid 65532 with no capability. Keep the
+  container on 123 when serving NTS: chronyd announces any other NTP port to
+  its NTS-KE clients, and a Service remapping it would send them to the wrong
+  port (the chart refuses to render that combination).
+* **Probes.** `chrony-entrypoint health` (startup/liveness) checks the
+  socket is bound and the server answers, synchronised or not - restarting
+  every replica during an upstream outage would only make it worse.
+  `chrony-entrypoint ready` (readiness) requires usable time: stratum, leap
+  status, root distance under `probes.readyMaxRootDistance`, and the NTS-KE
+  listener when serving NTS. A cold replica needs a few polls before it is
+  Ready, so rollouts surge first and never drop a serving pod early.
+* **Config check.** An init container runs `chrony-entrypoint config`, which
+  has chronyd parse the rendered configuration: a typo fails the pod with the
+  parser message instead of a crash loop, and
+  `kubectl logs <pod> -c config` shows the exact chrony.conf in use.
+
+## NTS server
+
+```yaml
+replicaCount: 3
+nts:
+  server:
+    enabled: true
+    certificate:
+      certManager:
+        enabled: true
+        issuerRef: {name: letsencrypt, kind: ClusterIssuer}
+        dnsNames: [time.example.org]
+      reloaderAnnotation: true   # restart on renewal (stakater/Reloader)
+service:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+chrony:
+  allow: [all]
+  rateLimit: "on"
+  ntsRateLimit: "on"
+```
+
+Or bring a `kubernetes.io/tls` Secret with `nts.server.certificate.existingSecret`.
+
+**Shared cookie keys.** Behind a Service, the NTS-KE handshake and the NTP
+requests of one client can land on different replicas, and a replica can only
+decrypt the cookies it issued. With more than one replica, a pre-install /
+pre-upgrade hook Job (`alpine/kubectl`, RBAC limited to creating Secrets and
+reading this one) creates chronyd's key file in the Secret
+`<fullname>-nts-keys` **only when it is missing**, and every pod loads it at
+startup. The keys are never rendered by the chart, so Argo CD (which runs the
+hook as PreSync) or `helm template` cannot regenerate them. The Secret is not
+owned by the release: it survives an uninstall, and so do the cookies clients
+hold.
+
+chronyd does not rotate shared keys (`ntsrotate 0`). To rotate: delete the
+Secret, `helm upgrade` (the Job creates new keys), then
+`kubectl rollout restart` the workload - clients whose cookies stop working
+redo NTS-KE on their own.
+
+To manage the keys yourself (External Secrets, Sealed Secrets...), generate
+the file and point `nts.server.sharedKeys.existingSecret` at it - no Job then:
+
+```sh
+# chronyd key dump format: header, key age, then 4 keys with consecutive ids
+# (the last one is current); 15 = AES-SIV-CMAC-256, 32-byte keys.
+{
+  echo NKS1; echo 0.0
+  base=$(( $(od -An -N4 -tu4 /dev/urandom) & 0x7ffffff0 ))
+  for i in 0 1 2 3; do
+    printf '%08X %s 15\n' $((base + i)) "$(openssl rand -hex 32 | tr a-f A-F)"
+  done
+} > ntskeys
+kubectl create secret generic chrony-nts-keys --from-file=ntskeys
+```
+
+```yaml
+nts:
+  server:
+    sharedKeys:
+      existingSecret: chrony-nts-keys
+```
+
+chronyd only reads its certificate at startup: without `reloaderAnnotation`
+(or an equivalent), restart the pods after a renewal and before the old
+certificate expires.
+
+## Node clock discipline
+
+```yaml
+workload:
+  kind: DaemonSet
+hostNetwork: true
+clockControl:
+  enabled: true
+tolerations:
+  - operator: Exists
+priorityClassName: system-node-critical
+```
+
+chronyd starts as root with `SYS_TIME`, `NET_BIND_SERVICE`, `SETUID`,
+`SETGID` and `DAC_OVERRIDE`, binds its sockets, then drops to uid 65532
+keeping `CAP_SYS_TIME` only. The clock is not namespaced: this steers the
+node, so nothing else on the node may (disable systemd-timesyncd / the node's
+own chronyd), and the chart refuses more than one replica of a Deployment or
+StatefulSet in this mode.
+
+## Changing sources without a restart
+
+`chrony.sourceFiles` lands in `/etc/chrony/sources.d`. With
+`chrony.sourceFilesRolloutOnChange: false`, an upgrade only updates the
+mounted files (kubelet syncs them within a minute); then:
+
+```sh
+for p in $(kubectl get pods -l app.kubernetes.io/instance=<release> -o name); do
+  kubectl exec "$p" -c chrony -- chronyc -h /run/chrony/state/chronyd.sock reload sources
+done
+```
+
+No measurement is lost. Everything else (environment, `confFiles`,
+`config.inline`) rolls the pods, since the entrypoint renders at startup.
+
+## Monitoring
+
+`monitoring.enabled` adds the [ntp-exporter](https://github.com/MaximeWewer/ntp-exporter)
+sidecar in agent mode, a `<fullname>-metrics` ClusterIP Service (kept off the
+client Service, which may be a LoadBalancer), and optionally a ServiceMonitor
+and a PrometheusRule. Per replica, labelled with its `node`:
+
+* `ntp_chrony_*` - chronyd's tracking report, read over the Unix command
+  socket: selected source, stratum, leap status, offset, dispersion, last
+  update;
+* `ntp_up`, `ntp_response_valid`, `ntp_root_distance_seconds`, ... for
+  `server="127.0.0.1:123"` - the replica queried over NTP on localhost, i.e.
+  what its clients actually receive;
+* `ntp_kernel_*` - only with `clockControl`, where the node clock is chronyd's.
+
+Alerts: chronyd unreadable, unsynchronised, stale (holdover), offset, stratum,
+no valid time served, served root distance. To watch the Service from outside
+the pods - and the NTS-KE certificate expiry - run a separate ntp-exporter in
+probe mode against it.
+
+## Troubleshooting
+
+| Symptom | Cause |
+|---------|-------|
+| `Disabled command socket` in the chronyd log | the state directory is world-accessible or not owned by 65532 / fsGroup 65532 - keep `CHRONY_STATE_DIR` on `state/` and `podSecurityContext.fsGroup: 65532` |
+| `Could not open /.../chrony.conf : Permission denied` (kernel log: `apparmor="DENIED" profile="/usr/sbin/chronyd"`) | image older than chrony-docker `2026.10.1` (rebuilt 2026-10-20): the node's AppArmor profile for `/usr/sbin/chronyd` caught an unconfined container |
+| `NTP_PORT=123 is below net.ipv4.ip_unprivileged_port_start` | hostNetwork without root: set the sysctl on the nodes, or use `clockControl` |
+| Pods never Ready, `root distance ... above READY_MAX_ROOT_DISTANCE` | still converging (minutes on a cold start), or upstream unreachable: check egress UDP/123 and, for NTS, TCP/4460 |
+| Custom `chrony.config`: pods never Ready, `connection refused` / no reply from `127.0.0.1` | the probes query the server on localhost: add `allow 127.0.0.1` and `allow ::1` |
+| `helm test` times out | `chrony.allow` does not cover the pod network, or a NetworkPolicy blocks the test pod |
+| `Fatal error : Another chronyd may already be running (pid=1)` after a restart | image older than chrony-docker `2026.10.1` (rebuilt 2026-10-20), which disables the pidfile and removes a stale one |
+
+{{ template "chart.requirementsSection" . }}
+
+{{ template "chart.valuesSection" . }}

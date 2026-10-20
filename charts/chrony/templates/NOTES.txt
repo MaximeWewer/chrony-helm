@@ -1,0 +1,67 @@
+{{- $fullName := include "chrony.fullname" . -}}
+{{- $kind := include "chrony.kind" . -}}
+chrony {{ .Chart.AppVersion }} installed as release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+
+Workload:   {{ $kind }}{{ if ne $kind "DaemonSet" }} x {{ .Values.replicaCount }}{{ end }}{{ if .Values.hostNetwork }} (hostNetwork){{ end }}
+{{- if .Values.service.enabled }}
+NTP:        {{ $fullName }}.{{ .Release.Namespace }}.svc:{{ .Values.service.ntpPort }}/udp ({{ .Values.service.type }})
+{{- if .Values.nts.server.enabled }}
+NTS-KE:     {{ $fullName }}.{{ .Release.Namespace }}.svc:{{ .Values.service.ntsPort }}/tcp
+{{- end }}
+{{- end }}
+Sources:    {{ if include "chrony.customConfig" . }}custom chrony.conf{{ else }}{{ concat .Values.chrony.servers .Values.chrony.pools .Values.chrony.peers | join ", " | default "none" }}{{ if .Values.nts.client.enabled }} (NTS){{ end }}{{ end }}
+Allowed:    {{ join ", " .Values.chrony.allow | default "localhost only" }}
+
+Check the sources and the synchronisation (chronyc talks over the Unix socket):
+
+  kubectl -n {{ .Release.Namespace }} exec {{ lower $kind }}/{{ $fullName }} -c chrony -- \
+    chronyc -h /run/chrony/state/chronyd.sock -N sources -v
+  kubectl -n {{ .Release.Namespace }} exec {{ lower $kind }}/{{ $fullName }} -c chrony -- \
+    chronyc -h /run/chrony/state/chronyd.sock tracking
+{{- if .Values.nts.client.enabled }}
+  kubectl -n {{ .Release.Namespace }} exec {{ lower $kind }}/{{ $fullName }} -c chrony -- \
+    chronyc -h /run/chrony/state/chronyd.sock -N authdata
+{{- end }}
+{{- if .Values.configCheck.enabled }}
+
+Rendered chrony.conf:
+
+  kubectl -n {{ .Release.Namespace }} logs {{ lower $kind }}/{{ $fullName }} -c config
+{{- end }}
+{{- if and .Values.tests.enabled .Values.service.enabled }}
+
+End-to-end query through the Service:
+
+  helm test -n {{ .Release.Namespace }} {{ .Release.Name }}
+{{- end }}
+{{- if not .Values.chrony.allow }}
+
+WARNING: chrony.allow is empty - chronyd answers localhost only and serves no client.
+{{- end }}
+{{- if and (has "all" .Values.chrony.allow) (not .Values.chrony.rateLimit) }}
+
+WARNING: chrony.allow contains "all" without chrony.rateLimit - consider `rateLimit: on`.
+{{- end }}
+{{- if and .Values.hostNetwork (not .Values.clockControl.enabled) (lt (int .Values.containerPorts.ntp) 1024) }}
+
+NOTE: hostNetwork with a non-root chronyd on port {{ .Values.containerPorts.ntp }}: the nodes need
+net.ipv4.ip_unprivileged_port_start <= {{ .Values.containerPorts.ntp }}, otherwise chrony-entrypoint stops with an explicit error.
+{{- end }}
+{{- $svc := .Values.service }}
+{{- if and $svc.enabled (has $svc.type (list "NodePort" "LoadBalancer")) (ne $svc.externalTrafficPolicy "Local") (not $svc.preservesClientIP) }}
+
+WARNING: service.type={{ $svc.type }} with externalTrafficPolicy={{ default "Cluster" $svc.externalTrafficPolicy }}: external clients reach
+chronyd with a node address as source. chrony.allow / deny judge the node, not the client - with
+private ranges allowed, every external client gets in. Set service.externalTrafficPolicy=Local.
+{{- end }}
+{{- if .Values.clockControl.enabled }}
+
+WARNING: clockControl is on - chronyd disciplines the NODE clock. Make sure nothing else does
+(systemd-timesyncd, the node's own chronyd/ntpd), or they will fight over it.
+{{- end }}
+{{- if and .Values.nts.server.enabled (include "chrony.ntsSharedKeys" .) (not .Values.nts.server.sharedKeys.existingSecret) }}
+
+NTS cookie keys are shared through the Secret {{ include "chrony.ntsKeysSecretName" . }}, created by a
+hook Job when missing and never rotated by chronyd. Rotate: delete the Secret, `helm upgrade`,
+then `kubectl rollout restart`. The Secret is not owned by the release and survives an uninstall.
+{{- end }}

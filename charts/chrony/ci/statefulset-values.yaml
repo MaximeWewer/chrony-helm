@@ -1,0 +1,9 @@
+workload:
+  kind: StatefulSet
+replicaCount: 3
+chrony:
+  local:
+    stratum: "10"
+    orphan: true
+persistence:
+  size: 32Mi

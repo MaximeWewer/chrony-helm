@@ -1,0 +1,13 @@
+replicaCount: 1
+workload:
+  kind: StatefulSet
+nts:
+  server:
+    enabled: true
+    certificate:
+      existingSecret: chrony-nts-tls
+    sharedKeys:
+      enabled: "true"
+      existingSecret: chrony-nts-keys
+  client:
+    trustedCertsSecret: internal-ca

@@ -1,0 +1,8 @@
+{{- /*
+extraDeploy - arbitrary Kubernetes manifests emitted with the release. Each
+list entry is a full object, rendered through `tpl`.
+*/ -}}
+{{- range .Values.extraDeploy }}
+---
+{{ tpl (toYaml .) $ }}
+{{- end }}

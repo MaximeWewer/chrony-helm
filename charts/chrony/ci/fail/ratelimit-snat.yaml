@@ -1,0 +1,6 @@
+# expect: external clients are SNATed to node addresses
+service:
+  type: LoadBalancer
+chrony:
+  allow: [all]
+  rateLimit: "on"

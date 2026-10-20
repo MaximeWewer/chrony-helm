@@ -1,0 +1,35 @@
+{{- /*
+auto = on for a Deployment / StatefulSet with more than one replica. A single
+replica cannot have a meaningful budget (it would block every drain), and
+DaemonSet pods are not evicted by `kubectl drain` anyway.
+*/ -}}
+{{- $mode := toString .Values.podDisruptionBudget.enabled -}}
+{{- if not (has $mode (list "auto" "true" "false")) -}}
+{{- fail (printf "podDisruptionBudget.enabled=%q is invalid - expected auto | true | false" $mode) -}}
+{{- end -}}
+{{- $multi := and (ne (include "chrony.kind" .) "DaemonSet") (gt (int .Values.replicaCount) 1) -}}
+{{- if or (eq $mode "true") (and (eq $mode "auto") $multi) -}}
+{{- $pdb := .Values.podDisruptionBudget -}}
+{{- if and $pdb.minAvailable $pdb.maxUnavailable -}}
+{{- fail "podDisruptionBudget: set minAvailable or maxUnavailable, not both" -}}
+{{- end -}}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "chrony.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "chrony.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "chrony.selectorLabels" . | nindent 6 }}
+  {{- if $pdb.minAvailable }}
+  minAvailable: {{ $pdb.minAvailable }}
+  {{- else }}
+  maxUnavailable: {{ default 1 $pdb.maxUnavailable }}
+  {{- end }}
+  {{- with $pdb.unhealthyPodEvictionPolicy }}
+  unhealthyPodEvictionPolicy: {{ . }}
+  {{- end }}
+{{- end }}

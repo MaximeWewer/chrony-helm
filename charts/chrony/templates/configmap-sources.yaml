@@ -1,0 +1,29 @@
+{{- if .Values.chrony.sourceFiles -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "chrony.fullname" . }}-sources
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "chrony.labels" . | nindent 4 }}
+data:
+  {{- range $name, $content := .Values.chrony.sourceFiles }}
+  {{ $name }}: |
+    {{- $content | nindent 4 }}
+  {{- end }}
+{{- end }}
+{{- if .Values.chrony.confFiles }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "chrony.fullname" . }}-confd
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "chrony.labels" . | nindent 4 }}
+data:
+  {{- range $name, $content := .Values.chrony.confFiles }}
+  {{ $name }}: |
+    {{- $content | nindent 4 }}
+  {{- end }}
+{{- end }}

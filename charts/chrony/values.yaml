@@ -1,0 +1,660 @@
+# =============================================================================
+# chrony - values
+# =============================================================================
+# Every knob of the image is reachable from here. The chart turns the `chrony`
+# block into the environment variables read by chrony-entrypoint, which renders
+# /run/chrony/state/chrony.conf on every start - see
+# https://github.com/maximewewer/chrony-docker for the variable reference.
+
+# -- Override the chart name used in resource names.
+nameOverride: ""
+# -- Override the full resource name (`<release>-chrony` by default).
+fullnameOverride: ""
+# -- Labels added to every resource the chart renders.
+commonLabels: {}
+
+image:
+  # -- chrony image: static chronyd/chronyc on distroless, non-root (65532).
+  repository: ghcr.io/maximewewer/chrony-docker
+  # -- Image tag (CalVer of chrony-docker; the chart's appVersion is the chrony
+  # release it ships).
+  tag: "2026.10.1"
+  # -- Image digest (`sha256:...`). When set it wins over the tag.
+  digest: ""
+  # -- Image pull policy.
+  pullPolicy: IfNotPresent
+
+# -- Pull secrets for private registries (`[{name: regcred}]`).
+imagePullSecrets: []
+
+# =============================================================================
+# Workload
+# =============================================================================
+workload:
+  # -- Controller kind.
+  #   Deployment  - N interchangeable time servers behind a Service (default).
+  #   StatefulSet - same, but each replica keeps its drift file and NTS cookies
+  #                 on a PVC, so a restart is back in sync in seconds instead of
+  #                 minutes.
+  #   DaemonSet   - one chronyd per node. Pair it with `hostNetwork` to serve
+  #                 the node IPs, with `service.internalTrafficPolicy: Local` to
+  #                 give every pod a node-local time source, or with
+  #                 `clockControl.enabled` to discipline the node clocks.
+  kind: Deployment
+
+# -- Replicas (Deployment / StatefulSet only). Two or more keeps time served
+# while a node drains; NTS servers then need shared cookie keys, see
+# `nts.server.sharedKeys`.
+replicaCount: 2
+
+# -- Controller update strategy, verbatim. Empty = a per-kind default that never
+# drops below the current serving capacity (Deployment: maxSurge 1 /
+# maxUnavailable 0; StatefulSet / DaemonSet: RollingUpdate).
+updateStrategy: {}
+# -- Old ReplicaSets / ControllerRevisions to keep.
+revisionHistoryLimit: 5
+# -- Seconds a new pod must stay Ready before it counts as available.
+minReadySeconds: 0
+# -- Deployment progress deadline. A cold chronyd needs a few polls before its
+# root distance drops under `probes.readyMaxRootDistance`, so leave headroom.
+progressDeadlineSeconds: 900
+# -- Pod termination grace period.
+terminationGracePeriodSeconds: 30
+
+# -- Run in the node network namespace (DaemonSet use case: serve NTP on the
+# node IPs). The port sysctl below cannot be set in the host namespace, so a
+# non-root chronyd then needs `net.ipv4.ip_unprivileged_port_start <= 123` on
+# the node itself, or `clockControl.enabled` (runs chronyd as root).
+hostNetwork: false
+# -- Pod DNS policy. Empty = ClusterFirstWithHostNet with hostNetwork,
+# ClusterFirst otherwise.
+dnsPolicy: ""
+
+# =============================================================================
+# chrony configuration
+# =============================================================================
+chrony:
+  # ---------------------------------------------------------------------------
+  # Time sources. An entry is a hostname/IP, to which `sourceOptions` (and `nts`
+  # when `nts.client.enabled`) are appended; an entry that already carries
+  # options (contains a space) is used verbatim:
+  #   servers:
+  #     - ntp.example.org
+  #     - "10.0.0.1 iburst prefer"
+  # ---------------------------------------------------------------------------
+  # -- `server` sources. Defaults to four public NTS servers, authenticated
+  # with `nts.client.enabled` - needs egress on UDP/123 and TCP/4460.
+  servers:
+    - time.cloudflare.com
+    - nts.netnod.se
+    - ptbtime1.ptb.de
+    - ptbtime2.ptb.de
+  # -- `pool` sources (e.g. `pool.ntp.org`, which has no NTS - disable
+  # `nts.client.enabled` or give the pool entry its own options).
+  pools: []
+  # -- `peer` sources (symmetric associations).
+  peers: []
+  # -- `refclock` lines, without the keyword (e.g. `PHC /dev/ptp0 poll 2`).
+  # The device must also be mounted through `extraVolumes`.
+  refclocks: []
+  # -- Options appended to every bare server/pool/peer entry.
+  sourceOptions: "iburst minpoll 6 maxpoll 10"
+
+  # -- `minsources`: sources that must agree before the clock is updated.
+  minSources: ""
+  # -- `maxdistance` in seconds.
+  maxDistance: ""
+  # -- `maxjitter` in seconds.
+  maxJitter: ""
+  # -- `authselectmode` (require / prefer / mix / ignore). Empty = `require`
+  # when every source is NTS, chrony's default otherwise.
+  authSelectMode: ""
+
+  # -- `local` reference: keep serving time when every upstream is lost.
+  # Use `orphan` with several replicas so they agree on one orphan leader.
+  local:
+    stratum: ""
+    orphan: false
+    distance: ""
+
+  # ---------------------------------------------------------------------------
+  # Serving
+  # ---------------------------------------------------------------------------
+  # -- Networks allowed to query this server (`allow`). Localhost is always
+  # allowed for the probes. Behind a `Cluster` Service the source address is
+  # often SNATed to a node IP, hence the private ranges by default; use
+  # `service.externalTrafficPolicy: Local` to see real client addresses.
+  # `all` opens the server to everyone - set `rateLimit` then.
+  allow:
+    - 10.0.0.0/8
+    - 172.16.0.0/12
+    - 192.168.0.0/16
+    - 100.64.0.0/10
+    - fc00::/7
+  # -- Networks refused (`deny`), evaluated before `allow`.
+  deny: []
+  # -- `ratelimit` for NTP: `on` = chrony's recommended
+  # `interval 3 burst 8 leak 2`, or raw arguments, or empty / `off`.
+  rateLimit: ""
+  # -- `ntsratelimit` for NTS-KE, same syntax as `rateLimit`.
+  ntsRateLimit: ""
+  # -- `clientloglimit` in bytes (memory used to track clients).
+  clientLogLimit: ""
+  # -- `noclientlog`: do not track clients at all (disables `rateLimit`).
+  noClientLog: false
+  # -- `smoothtime` arguments, for leap smearing (e.g. `400 0.001 leaponly`).
+  smoothTime: ""
+  # -- `leapseclist` path, or `off`. Empty = the list shipped in the image.
+  leapSecList: ""
+  # -- `leapsecmode` (system / step / slew / ignore).
+  leapSecMode: ""
+  # -- `bindaddress` entries. Empty = every address of the pod.
+  bindAddresses: []
+
+  # ---------------------------------------------------------------------------
+  # Runtime
+  # ---------------------------------------------------------------------------
+  # -- chronyd log level (`-L`): 0 informational ... 3 fatal. Empty = chronyd.
+  logLevel: ""
+  # -- Address family (`4` or `6`). Empty = both.
+  ipMode: ""
+  # -- Seccomp filter level (`-F`). 1 = kill on a forbidden syscall, 0 = off.
+  scfilterLevel: 1
+  # -- `log` statistics written to the state directory (e.g.
+  # `tracking measurements statistics`). They are files, not stdout.
+  logs: ""
+  # -- Extra chronyd command line arguments.
+  extraArgs: []
+  # -- Raw directives appended to the generated chrony.conf.
+  extraConf: ""
+
+  # -- Source files (`<name>.sources`, server/pool/peer lines) mounted in
+  # /etc/chrony/sources.d. chronyd re-reads them on `chronyc reload sources`,
+  # so they can change without losing measurements - see
+  # `sourceFilesRolloutOnChange`.
+  sourceFiles: {}
+  # Example:
+  #   sourceFiles:
+  #     internal.sources: |
+  #       server ntp1.corp.example iburst
+  #       server ntp2.corp.example iburst
+  # -- Roll the pods when `sourceFiles` change. Set to false to update the
+  # mounted files in place and run `chronyc reload sources` instead (see the
+  # chart README).
+  sourceFilesRolloutOnChange: true
+
+  # -- Drop-in files (`<name>.conf`) mounted in /etc/chrony/conf.d and loaded
+  # with `confdir` after the generated directives.
+  confFiles: {}
+
+  # Bring your own chrony.conf. The environment-driven rendering is then
+  # skipped entirely: keep the state paths on /run/chrony/state,
+  # `bindcmdaddress /run/chrony/state/chronyd.sock` / `cmdport 0` so the
+  # probes and the exporter keep working, and `allow 127.0.0.1` / `allow ::1`:
+  # the probes query the server on localhost. A pidfile in the state directory
+  # is removed by the entrypoint at every start (it could only be stale).
+  config:
+    # -- Complete chrony.conf, rendered through `tpl`.
+    inline: ""
+    # -- Existing ConfigMap holding a complete chrony.conf.
+    existingConfigMap: ""
+    # -- Key of the configuration in `existingConfigMap`.
+    key: chrony.conf
+
+# =============================================================================
+# NTS - Network Time Security
+# =============================================================================
+nts:
+  client:
+    # -- Authenticate every bare server/pool/peer entry with NTS (`nts`
+    # option). With all sources on NTS, `authselectmode require` is implied.
+    enabled: true
+    # -- Secret with extra CA certificates (PEM) trusted for NTS-KE, for an
+    # internal NTS server. Mounted in /etc/chrony/nts-trust and passed to
+    # `ntstrustedcerts`. The system bundle stays trusted.
+    trustedCertsSecret: ""
+
+  server:
+    # -- Serve NTS-KE on `containerPorts.nts` (TCP). Needs a certificate.
+    enabled: false
+    certificate:
+      # -- Existing `kubernetes.io/tls` Secret (tls.crt / tls.key). Wins over
+      # cert-manager.
+      existingSecret: ""
+      certManager:
+        # -- Request the certificate from cert-manager.
+        enabled: false
+        issuerRef:
+          # -- Issuer name.
+          name: ""
+          # -- Issuer / ClusterIssuer.
+          kind: ClusterIssuer
+          # -- Issuer API group.
+          group: cert-manager.io
+        # -- DNS names the clients use to reach the NTS-KE endpoint. The first
+        # is the common name.
+        dnsNames: []
+        # -- Certificate lifetime.
+        duration: 2160h
+        # -- Renew this long before expiry.
+        renewBefore: 720h
+        privateKey:
+          # -- ECDSA / RSA / Ed25519.
+          algorithm: ECDSA
+          # -- Key size (256/384 for ECDSA, 2048+ for RSA).
+          size: 256
+          # -- Generate a new key on every renewal.
+          rotationPolicy: Always
+      # -- Add the stakater/Reloader annotation so the pods restart when the
+      # certificate Secret is renewed. chronyd only reads the certificate at
+      # startup; without a reloader, restart the pods before the old one expires.
+      reloaderAnnotation: false
+
+    # -- `ntsntpserver`: the NTP endpoint announced to NTS-KE clients, when it
+    # differs from the address they used for NTS-KE.
+    ntpServer: []
+    # -- `ntsrotate` interval in seconds. Ignored with shared keys, which never
+    # rotate in chronyd (rotate them by replacing the Secret).
+    rotate: ""
+
+    # Every replica must decrypt the cookies issued by the others: behind a
+    # Service, the NTS-KE handshake and the NTP requests of one client do not
+    # necessarily land on the same pod. A pre-install/pre-upgrade hook Job
+    # therefore creates chronyd's key file in the Secret `<fullname>-nts-keys`
+    # when it is missing, and every pod loads it at startup. The keys are never
+    # rendered by the chart, so Argo CD / `helm template` cannot regenerate
+    # them. They never rotate in chronyd: delete the Secret, upgrade, then
+    # `kubectl rollout restart` - clients redo NTS-KE transparently.
+    sharedKeys:
+      # -- auto = on whenever more than one pod can serve the same Service
+      # (Deployment / StatefulSet with replicaCount > 1). true / false forces.
+      enabled: auto
+      # -- Existing Secret with a chronyd `ntskeys` file (key `ntskeys`). No
+      # hook Job then.
+      existingSecret: ""
+      job:
+        image:
+          # -- Image of the key creation Job: needs sh, od, tr, printf and
+          # kubectl.
+          repository: alpine/kubectl
+          # -- Tag.
+          tag: "1.37.0"
+          # -- Digest; wins over the tag.
+          digest: ""
+          # -- Pull policy.
+          pullPolicy: IfNotPresent
+        # -- Job resources.
+        resources:
+          requests:
+            cpu: 10m
+            memory: 32Mi
+          limits:
+            memory: 128Mi
+
+# =============================================================================
+# Ports
+# =============================================================================
+containerPorts:
+  # -- NTP port inside the pod. Keep 123: an NTS server advertises any other
+  # port to its clients, and a Service remapping it would then break NTS.
+  ntp: 123
+  # -- NTS-KE port inside the pod.
+  nts: 4460
+
+# -- Set the namespaced sysctl `net.ipv4.ip_unprivileged_port_start` to the
+# lowest chrony port, so the non-root chronyd can bind 123. Safe sysctl since
+# Kubernetes 1.22; skipped with hostNetwork and when chronyd runs as root.
+unprivilegedPortSysctl: true
+
+# =============================================================================
+# Service
+# =============================================================================
+service:
+  # -- Create the Service.
+  enabled: true
+  # -- ClusterIP / NodePort / LoadBalancer. A LoadBalancer carrying both UDP
+  # (NTP) and TCP (NTS-KE) needs mixed-protocol support (GA in 1.26).
+  type: ClusterIP
+  # -- Service port for NTP (UDP).
+  ntpPort: 123
+  # -- Service port for NTS-KE (TCP), only when `nts.server.enabled`.
+  ntsPort: 4460
+  # -- Fixed node ports (NodePort / LoadBalancer).
+  nodePorts:
+    ntp: ""
+    nts: ""
+  # -- Fixed cluster IP.
+  clusterIP: ""
+  # -- SingleStack / PreferDualStack / RequireDualStack.
+  ipFamilyPolicy: ""
+  # -- IPv4 / IPv6 order.
+  ipFamilies: []
+  # -- Cluster / Local, for NodePort / LoadBalancer. `Cluster` SNATs external
+  # clients to a node address: `allow` / `deny` then judge the node, not the
+  # client, and `rateLimit` / `ntsRateLimit` throttle every client behind a
+  # node as one - the chart refuses that combination. Use `Local`.
+  externalTrafficPolicy: ""
+  # -- Set to true when the data path keeps client addresses even with
+  # `externalTrafficPolicy: Cluster` (e.g. Cilium in DSR mode), to lift the
+  # check above.
+  preservesClientIP: false
+  # -- Cluster / Local. Local with a DaemonSet = every pod asks the chronyd of
+  # its own node.
+  internalTrafficPolicy: ""
+  # -- None / ClientIP.
+  sessionAffinity: ""
+  # -- LoadBalancer IP (when the provider honours it).
+  loadBalancerIP: ""
+  # -- LoadBalancer implementation class.
+  loadBalancerClass: ""
+  # -- Source ranges allowed through the LoadBalancer.
+  loadBalancerSourceRanges: []
+  # -- Service annotations (e.g. MetalLB / cloud LB settings).
+  annotations: {}
+  # -- Extra Service labels.
+  labels: {}
+
+# =============================================================================
+# State
+# =============================================================================
+# chronyd keeps its drift file, NTS cookies/keys and command socket in
+# /run/chrony/state. The volume is mounted one level up: chronyd refuses a
+# command socket in a world-accessible directory, which is what an emptyDir or
+# a fresh PVC root is, so the entrypoint creates `state/` itself with 0700.
+persistence:
+  # -- StatefulSet only: one PVC per replica instead of an emptyDir.
+  enabled: true
+  # -- Storage class. Empty = the cluster default.
+  storageClass: ""
+  # -- PVC access modes.
+  accessModes: [ReadWriteOnce]
+  # -- PVC size. chronyd writes a few kilobytes.
+  size: 64Mi
+  # -- PVC annotations.
+  annotations: {}
+  # -- StatefulSet PVC retention (Retain / Delete).
+  retentionPolicy:
+    whenDeleted: Retain
+    whenScaled: Retain
+
+# -- emptyDir state volume options (Deployment / DaemonSet, or StatefulSet
+# without persistence).
+emptyDir:
+  medium: ""
+  sizeLimit: 16Mi
+
+# =============================================================================
+# Node clock control
+# =============================================================================
+clockControl:
+  # -- Let chronyd step/slew the NODE clock (the clock is not namespaced).
+  # Starts chronyd as root with CAP_SYS_TIME; it drops to uid 65532 right after
+  # binding, keeping only that capability. Use it with a DaemonSet and only
+  # where nothing else (systemd-timesyncd, the node's own chronyd) disciplines
+  # the clock.
+  enabled: false
+
+# =============================================================================
+# Probes - chrony-entrypoint queries the local server like a real client.
+# =============================================================================
+probes:
+  # -- `ready` fails while the root distance is above this (seconds).
+  readyMaxRootDistance: 1
+  # -- Both probes fail above this stratum.
+  maxStratum: 15
+  # -- Timeout of one probe query (seconds).
+  timeout: 3
+
+# -- Liveness: sockets bound and the server answers, synchronised or not -
+# restarting every replica during an upstream outage would only make it worse.
+livenessProbe:
+  exec:
+    command: [/chrony-entrypoint, health]
+  periodSeconds: 30
+  timeoutSeconds: 10
+  failureThreshold: 3
+# -- Readiness: the server serves usable time (stratum, leap, root distance and
+# the NTS-KE listener).
+readinessProbe:
+  exec:
+    command: [/chrony-entrypoint, ready]
+  periodSeconds: 10
+  timeoutSeconds: 10
+  failureThreshold: 3
+# -- Startup: same check as liveness, while chronyd binds its sockets.
+startupProbe:
+  exec:
+    command: [/chrony-entrypoint, health]
+  periodSeconds: 2
+  timeoutSeconds: 10
+  failureThreshold: 30
+
+# -- Init container running `chrony-entrypoint config`: renders the
+# configuration, has chronyd parse it (fails the pod with the parser error
+# instead of a crash loop) and prints it to `kubectl logs -c config`. Always on
+# with `clockControl` - it also creates the state directory as uid 65532.
+configCheck:
+  enabled: true
+
+# =============================================================================
+# Monitoring - ntp-exporter sidecar (https://github.com/MaximeWewer/ntp-exporter)
+# =============================================================================
+# Agent mode, next to chronyd in the same pod:
+#   * chrony option - reads chronyd's tracking report over the Unix command
+#     socket (ntp_chrony_*: selected source, stratum, leap status, offset being
+#     corrected, dispersion, last update);
+#   * the local server, queried over NTP on localhost like a client would
+#     (ntp_up / ntp_response_valid / ntp_root_distance_seconds ...): what the
+#     clients of this replica actually get;
+#   * the kernel option (node clock state) only when chronyd disciplines it.
+monitoring:
+  # -- Run the exporter sidecar and the `<fullname>-metrics` Service.
+  enabled: false
+  exporter:
+    image:
+      # -- Exporter image.
+      repository: ghcr.io/maximewewer/ntp-exporter
+      # -- Exporter tag.
+      tag: "2026.10.1"
+      # -- Exporter digest; wins over the tag.
+      digest: ""
+      # -- Pull policy.
+      pullPolicy: IfNotPresent
+    # -- Metrics port.
+    port: 9559
+    # -- Interval between two measurement cycles (5s to 1h). A burst to an
+    # unreachable server must fit in it: keep 30s or more.
+    collectionInterval: 60s
+    # -- Measure the local chronyd over NTP on localhost.
+    measureLocalServer: true
+    # -- Extra reference servers measured from the pod (at most 2 in total with
+    # the local server; `nts://host` for NTS). Not pools nor public servers:
+    # every replica queries them.
+    referenceServers: []
+    # -- Kernel option (node clock state): auto = on with `clockControl`,
+    # where it reflects what chronyd does; true / false forces.
+    kernel: auto
+    # -- debug / info / warn / error.
+    logLevel: info
+    # -- Extra exporter environment variables (`NTP_EXPORTER_*`).
+    extraEnv: []
+    # -- Exporter resources.
+    resources:
+      requests:
+        cpu: 5m
+        memory: 24Mi
+      limits:
+        memory: 64Mi
+  serviceMonitor:
+    # -- Create a prometheus-operator ServiceMonitor.
+    enabled: false
+    # -- Scrape interval.
+    interval: 30s
+    # -- Scrape timeout.
+    scrapeTimeout: 10s
+    # -- Extra labels (e.g. the `release` your Prometheus selects).
+    labels: {}
+    # -- Relabelings.
+    relabelings: []
+    # -- Metric relabelings.
+    metricRelabelings: []
+  prometheusRule:
+    # -- Create a PrometheusRule.
+    enabled: false
+    # -- Extra labels.
+    labels: {}
+    # -- Ship the built-in alerts (chronyd unreadable, not synchronised, stale,
+    # local server not serving usable time, offset, stratum).
+    defaultsEnabled: true
+    # -- Alert when chronyd's |system time offset| stays above this (seconds).
+    maxOffsetSeconds: 0.1
+    # -- Alert when the local server's root distance stays above this (seconds).
+    maxRootDistanceSeconds: 1
+    # -- Alert when the stratum stays above this.
+    maxStratum: 10
+    # -- Severity label of the built-in alerts.
+    severity: warning
+    # -- Extra rules appended to the group.
+    additionalRules: []
+
+# =============================================================================
+# Hardening
+# =============================================================================
+serviceAccount:
+  # -- Create a dedicated ServiceAccount.
+  create: true
+  # -- Name. Empty = the full name.
+  name: ""
+  # -- ServiceAccount annotations.
+  annotations: {}
+  # -- Mount the API token. chrony never talks to the API server.
+  automountServiceAccountToken: false
+
+# -- Pod security context. fsGroup 65532 makes the state volume writable by the
+# image user and gives `state/` the group chronyd checks.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  fsGroupChangePolicy: OnRootMismatch
+  seccompProfile:
+    type: RuntimeDefault
+
+# -- chronyd container security context. With `clockControl.enabled` the chart
+# overrides the user (root) and the capabilities, see above.
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  privileged: false
+  capabilities:
+    drop: [ALL]
+
+# -- Exporter container security context.
+exporterSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: [ALL]
+
+# -- chronyd resources. chronyd is tiny; the limit only guards a leak.
+resources:
+  requests:
+    cpu: 10m
+    memory: 16Mi
+  limits:
+    memory: 64Mi
+
+# =============================================================================
+# Scheduling
+# =============================================================================
+# -- Pod annotations.
+podAnnotations: {}
+# -- Pod labels.
+podLabels: {}
+# -- Node selector.
+nodeSelector: {}
+# -- Tolerations. A node-clock DaemonSet usually wants `- operator: Exists`.
+tolerations: []
+# -- Full affinity; takes precedence over the presets below.
+affinity: {}
+# -- Spread replicas across nodes: "" / soft / hard. Ignored by DaemonSets.
+podAntiAffinityPreset: soft
+# -- Pin pods to nodes with a label.
+nodeAffinityPreset:
+  # -- "" / soft / hard.
+  type: ""
+  # -- Node label key.
+  key: ""
+  # -- Accepted values.
+  values: []
+# -- Topology spread constraints. The release selector labels are filled in
+# when `labelSelector` is omitted.
+topologySpreadConstraints: []
+# -- Priority class. A node-clock DaemonSet usually wants
+# `system-node-critical`.
+priorityClassName: ""
+
+# -- PodDisruptionBudget. auto = on for Deployment / StatefulSet with more than
+# one replica.
+podDisruptionBudget:
+  enabled: auto
+  # -- If both are empty, `maxUnavailable: 1`. Set only one.
+  minAvailable: ""
+  maxUnavailable: ""
+  # -- "" / AlwaysAllow / IfHealthyBudget.
+  unhealthyPodEvictionPolicy: ""
+
+# =============================================================================
+# NetworkPolicy
+# =============================================================================
+networkPolicy:
+  # -- Default-deny the chrony pods, then open what they need.
+  enabled: false
+  # -- Who may query NTP / NTS-KE (NetworkPolicyPeer list). Empty = any
+  # source - chrony's own `allow` still applies.
+  ingressFrom: []
+  # Example:
+  #   - namespaceSelector: {}         # every pod of the cluster
+  #   - ipBlock: {cidr: 192.0.2.0/24} # an office network
+  # -- Namespace of Prometheus, allowed on the metrics port. Empty = the
+  # release namespace.
+  prometheusNamespace: ""
+  # -- Allow DNS to kube-dns (UDP/TCP 53) - sources are hostnames.
+  allowDNS: true
+  # -- Destinations of upstream NTP (UDP/123) and NTS-KE (TCP/4460).
+  upstreamCIDRs:
+    - 0.0.0.0/0
+    - ::/0
+  # -- Extra ingress rules, verbatim.
+  extraIngress: []
+  # -- Extra egress rules, verbatim.
+  extraEgress: []
+
+# =============================================================================
+# Extension points
+# =============================================================================
+# -- Extra environment variables for chronyd (any chrony-entrypoint variable).
+extraEnv: []
+# -- Extra envFrom sources for chronyd.
+extraEnvFrom: []
+# -- Extra pod volumes (e.g. `/dev/ptp0` for a PHC refclock).
+extraVolumes: []
+# -- Extra chronyd volume mounts.
+extraVolumeMounts: []
+# -- Extra init containers, run before `config`.
+extraInitContainers: []
+# -- Extra sidecar containers.
+sidecars: []
+# -- Extra manifests rendered with the release (through `tpl`).
+extraDeploy: []
+
+# =============================================================================
+# helm test
+# =============================================================================
+tests:
+  # -- Render the `helm test` pod: a one-shot `chronyd -Q` that must get a
+  # usable answer from the Service.
+  enabled: true
+  # -- Seconds the test client waits for a usable sample.
+  timeout: 30

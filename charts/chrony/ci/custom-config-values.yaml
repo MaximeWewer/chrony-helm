@@ -1,0 +1,14 @@
+chrony:
+  config:
+    inline: |
+      # {{ .Release.Name }}
+      driftfile /run/chrony/state/drift
+      ntsdumpdir /run/chrony/state
+      pidfile /run/chrony/state/chronyd.pid
+      bindcmdaddress /run/chrony/state/chronyd.sock
+      cmdport 0
+      pool pool.ntp.org iburst
+      # The probes query the server on localhost.
+      allow 127.0.0.1
+      allow ::1
+      allow 10.0.0.0/8

@@ -1,0 +1,11 @@
+# expect: external clients are SNATed to node addresses
+service:
+  type: NodePort
+  externalTrafficPolicy: Cluster
+nts:
+  server:
+    enabled: true
+    certificate:
+      existingSecret: tls
+chrony:
+  ntsRateLimit: "on"

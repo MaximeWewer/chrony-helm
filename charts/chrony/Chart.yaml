@@ -1,0 +1,55 @@
+apiVersion: v2
+name: chrony
+description: |
+  Hardened chrony NTP/NTS server for Kubernetes - distroless, non-root,
+  seccomp-filtered chronyd as a Deployment, StatefulSet or DaemonSet, with
+  NTS (client and server), shared NTS cookie keys across replicas,
+  cert-manager integration and an ntp-exporter sidecar.
+type: application
+# The last published version. Do not bump it by hand: release-helm.yml computes
+# the next free CalVer (YYYY.M.PATCH) from the registry, stamps it here, then
+# commits the result back to main once the push to GHCR has succeeded.
+version: 2026.10.1
+# chrony release shipped by the default image (values.yaml image.tag).
+appVersion: "4.9"
+kubeVersion: ">=1.27.0-0"
+keywords:
+  - chrony
+  - ntp
+  - nts
+  - time
+  - clock
+  - timeserver
+home: https://github.com/maximewewer/chrony-helm
+sources:
+  - https://github.com/maximewewer/chrony-helm
+  - https://github.com/maximewewer/chrony-docker
+  - https://github.com/maximewewer/ntp-exporter
+  - https://chrony-project.org
+maintainers:
+  - name: maximewewer
+    url: https://github.com/maximewewer
+# =============================================================================
+# ArtifactHub annotations - https://artifacthub.io/docs/topics/annotations/helm/
+# =============================================================================
+annotations:
+  artifacthub.io/category: networking
+  artifacthub.io/license: MIT
+  artifacthub.io/prerelease: "false"
+  artifacthub.io/containsSecurityUpdates: "false"
+  artifacthub.io/operator: "false"
+  artifacthub.io/links: |
+    - name: source
+      url: https://github.com/maximewewer/chrony-helm
+    - name: image
+      url: https://github.com/maximewewer/chrony-docker
+    - name: chrony documentation
+      url: https://chrony-project.org/documentation.html
+  artifacthub.io/images: |
+    - name: chrony
+      image: ghcr.io/maximewewer/chrony-docker:2026.10.1
+    - name: ntp-exporter
+      image: ghcr.io/maximewewer/ntp-exporter:2026.10.1
+  artifacthub.io/recommendations: |
+    - url: https://artifacthub.io/packages/helm/cert-manager/cert-manager
+    - url: https://artifacthub.io/packages/helm/prometheus-community/kube-prometheus-stack

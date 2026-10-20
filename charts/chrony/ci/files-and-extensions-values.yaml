@@ -1,0 +1,24 @@
+chrony:
+  sourceFiles:
+    internal.sources: |
+      server 10.0.0.1 iburst
+  sourceFilesRolloutOnChange: false
+  confFiles:
+    tuning.conf: |
+      maxupdateskew 100
+  extraArgs: ["-r"]
+  extraConf: |
+    makestep 1 3
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: ScheduleAnyway
+image:
+  digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+extraDeploy:
+  - apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: "{{ .Release.Name }}-extra"
+    data:
+      k: v

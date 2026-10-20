@@ -1,0 +1,38 @@
+{{- $cert := .Values.nts.server.certificate -}}
+{{- if and .Values.nts.server.enabled (not $cert.existingSecret) $cert.certManager.enabled -}}
+{{- $cm := $cert.certManager -}}
+{{- if not $cm.issuerRef.name -}}
+{{- fail "nts.server.certificate.certManager.issuerRef.name is required" -}}
+{{- end -}}
+{{- if not $cm.dnsNames -}}
+{{- fail "nts.server.certificate.certManager.dnsNames is required: NTS clients verify the name they connect to" -}}
+{{- end -}}
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "chrony.fullname" . }}-nts
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "chrony.labels" . | nindent 4 }}
+spec:
+  secretName: {{ include "chrony.ntsCertSecretName" . }}
+  commonName: {{ first $cm.dnsNames | quote }}
+  dnsNames:
+    {{- toYaml $cm.dnsNames | nindent 4 }}
+  duration: {{ $cm.duration }}
+  renewBefore: {{ $cm.renewBefore }}
+  usages:
+    - digital signature
+    - key encipherment
+    - server auth
+  privateKey:
+    algorithm: {{ $cm.privateKey.algorithm }}
+    {{- if ne $cm.privateKey.algorithm "Ed25519" }}
+    size: {{ $cm.privateKey.size }}
+    {{- end }}
+    rotationPolicy: {{ $cm.privateKey.rotationPolicy }}
+  issuerRef:
+    name: {{ $cm.issuerRef.name }}
+    kind: {{ $cm.issuerRef.kind }}
+    group: {{ $cm.issuerRef.group }}
+{{- end }}

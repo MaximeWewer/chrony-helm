@@ -1,0 +1,105 @@
+{{- /*
+One controller - Deployment, StatefulSet or DaemonSet - around the shared pod
+template in _pod.tpl. Render-time guards live here so every kind gets them.
+*/ -}}
+{{- $kind := include "chrony.kind" . -}}
+{{- $fullName := include "chrony.fullname" . -}}
+{{- if and .Values.nts.server.enabled .Values.service.enabled (ne (int .Values.containerPorts.ntp) (int .Values.service.ntpPort)) -}}
+{{- fail (printf "nts.server.enabled with containerPorts.ntp=%d != service.ntpPort=%d: chronyd advertises its own NTP port to NTS-KE clients, which would then miss the Service. Keep both on the same port." (int .Values.containerPorts.ntp) (int .Values.service.ntpPort)) -}}
+{{- end -}}
+{{- $svc := .Values.service -}}
+{{- $snat := and $svc.enabled (has $svc.type (list "NodePort" "LoadBalancer")) (ne $svc.externalTrafficPolicy "Local") (not $svc.preservesClientIP) -}}
+{{- $limited := or (not (has (toString .Values.chrony.rateLimit) (list "" "off"))) (and .Values.nts.server.enabled (not (has (toString .Values.chrony.ntsRateLimit) (list "" "off")))) -}}
+{{- if and $snat $limited -}}
+{{- fail (printf "chrony.rateLimit / ntsRateLimit with service.type=%s and externalTrafficPolicy=%q: external clients are SNATed to node addresses, so chronyd would throttle every client behind a node as one. Set service.externalTrafficPolicy=Local (or service.preservesClientIP=true if your data path keeps client addresses)." $svc.type (default "Cluster" $svc.externalTrafficPolicy)) -}}
+{{- end -}}
+{{- if and .Values.clockControl.enabled (ne $kind "DaemonSet") (gt (int .Values.replicaCount) 1) -}}
+{{- fail "clockControl.enabled with several replicas of a Deployment/StatefulSet would let two chronyd discipline the same node clock - use workload.kind=DaemonSet" -}}
+{{- end -}}
+{{- if and .Values.chrony.config.inline .Values.chrony.config.existingConfigMap -}}
+{{- fail "chrony.config.inline and chrony.config.existingConfigMap are mutually exclusive" -}}
+{{- end -}}
+{{- range $name, $_ := .Values.chrony.sourceFiles -}}
+{{- if not (hasSuffix ".sources" $name) -}}
+{{- fail (printf "chrony.sourceFiles.%s: chronyd only reads *.sources files from sources.d" $name) -}}
+{{- end -}}
+{{- end -}}
+{{- range $name, $_ := .Values.chrony.confFiles -}}
+{{- if not (hasSuffix ".conf" $name) -}}
+{{- fail (printf "chrony.confFiles.%s: chronyd only reads *.conf files from conf.d" $name) -}}
+{{- end -}}
+{{- end -}}
+apiVersion: apps/v1
+kind: {{ $kind }}
+metadata:
+  name: {{ $fullName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "chrony.labels" . | nindent 4 }}
+spec:
+  {{- if ne $kind "DaemonSet" }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  revisionHistoryLimit: {{ .Values.revisionHistoryLimit }}
+  minReadySeconds: {{ .Values.minReadySeconds }}
+  selector:
+    matchLabels:
+      {{- include "chrony.selectorLabels" . | nindent 6 }}
+  {{- if eq $kind "Deployment" }}
+  progressDeadlineSeconds: {{ .Values.progressDeadlineSeconds }}
+  strategy:
+    {{- if .Values.updateStrategy }}
+    {{- toYaml .Values.updateStrategy | nindent 4 }}
+    {{- else }}
+    # Surge first: a new pod needs a few polls before it is Ready, and the old
+    # one keeps serving until then.
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+    {{- end }}
+  {{- else if eq $kind "StatefulSet" }}
+  serviceName: {{ include "chrony.headlessServiceName" . }}
+  # Replicas are independent time servers: no reason to start them in order.
+  podManagementPolicy: Parallel
+  updateStrategy:
+    {{- if .Values.updateStrategy }}
+    {{- toYaml .Values.updateStrategy | nindent 4 }}
+    {{- else }}
+    type: RollingUpdate
+    {{- end }}
+  {{- if .Values.persistence.enabled }}
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: {{ .Values.persistence.retentionPolicy.whenDeleted }}
+    whenScaled: {{ .Values.persistence.retentionPolicy.whenScaled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: state
+        labels:
+          {{- include "chrony.selectorLabels" . | nindent 10 }}
+        {{- with .Values.persistence.annotations }}
+        annotations:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+      spec:
+        accessModes:
+          {{- toYaml .Values.persistence.accessModes | nindent 10 }}
+        {{- with .Values.persistence.storageClass }}
+        storageClassName: {{ if eq . "-" }}""{{ else }}{{ . }}{{ end }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size }}
+  {{- end }}
+  {{- else }}
+  updateStrategy:
+    {{- if .Values.updateStrategy }}
+    {{- toYaml .Values.updateStrategy | nindent 4 }}
+    {{- else }}
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+    {{- end }}
+  {{- end }}
+  template:
+    {{- include "chrony.podTemplate" . | nindent 4 }}

@@ -1,0 +1,84 @@
+name: Lint and Test Chart
+
+on:
+  pull_request:
+    paths:
+      - 'charts/**'
+      - 'scripts/**'
+      - 'Makefile'
+      - '.github/workflows/lint-test.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'charts/**'
+      - 'scripts/**'
+      - 'Makefile'
+      - '.github/workflows/lint-test.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  static:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Helm
+        uses: azure/setup-helm@v5
+
+      - name: Install helm-docs
+        run: go install github.com/norwoodj/helm-docs/cmd/helm-docs@v1.14.2
+
+      - name: README up to date
+        run: PATH="$PATH:$(go env GOPATH)/bin" make docs-check
+
+      - name: Lint (defaults + every ci/*-values.yaml)
+        run: make lint
+
+      - name: Render and check manifests
+        run: |
+          pip install --quiet pyyaml
+          make template
+
+      - name: Validate against the Kubernetes schemas
+        run: make kubeconform
+
+  e2e:
+    needs: static
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Shapes that need nothing but a bare cluster (no cert-manager, no
+        # prometheus-operator CRDs).
+        values:
+          - default
+          - statefulset
+          - files-and-extensions
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Helm
+        uses: azure/setup-helm@v5
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+
+      - name: Install, wait for readiness, helm test
+        run: |
+          # files-and-extensions pins a fake digest to exercise the template;
+          # the e2e run uses the real tag.
+          make e2e E2E_VALUES=charts/chrony/ci/${{ matrix.values }}-values.yaml \
+            E2E_ARGS="--set image.digest="
+
+      - name: Diagnostics
+        if: failure()
+        run: |
+          kubectl -n chrony-e2e get all -o wide
+          kubectl -n chrony-e2e describe pods
+          kubectl -n chrony-e2e logs -l app.kubernetes.io/instance=chrony-e2e --all-containers --prefix --tail=200

@@ -1,0 +1,8 @@
+# Rate limiting behind a Cluster-policy LoadBalancer whose data path keeps
+# client addresses (Cilium DSR): allowed through service.preservesClientIP.
+service:
+  type: LoadBalancer
+  preservesClientIP: true
+chrony:
+  allow: [all]
+  rateLimit: "on"
